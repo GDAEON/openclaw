@@ -83,9 +83,9 @@ jobs:
             exit 1
           fi
 
-          CONFIG_FILE="$(find . -type f -path "*/.docker/openclaw/openclaw.json" | head -n1 || true)"
+          CONFIG_FILE="$(find . -type f \( -path "*/deploy/openclaw.prod.json" -o -path "*/config/openclaw.prod.json" -o -path "*/.docker/openclaw/openclaw.json" \) | head -n1 || true)"
           if [ -z "$CONFIG_FILE" ]; then
-            echo "Cannot find .docker/openclaw/openclaw.json in repo" >&2
+            echo "Cannot find a tracked deploy config in repo" >&2
             exit 1
           fi
 
@@ -151,7 +151,7 @@ jobs:
 
             APP_DIR="${HOME}/${IMAGE_REPO}"
             COMPOSE_DIR="${APP_DIR}/compose"
-            CONFIG_SOURCE="$(find "${APP_DIR}" -type f -path "*/.docker/openclaw/openclaw.json" | head -n1 || true)"
+            CONFIG_SOURCE="$(find "${APP_DIR}" -type f \( -path "*/deploy/openclaw.prod.json" -o -path "*/config/openclaw.prod.json" -o -path "*/.docker/openclaw/openclaw.json" \) | head -n1 || true)"
             CONFIG_DIR="${APP_DIR}/state/openclaw"
             WORKSPACE_DIR="${APP_DIR}/state/workspace"
 
