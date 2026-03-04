@@ -1,0 +1,241 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "dev or prod"
+        type: choice
+        required: true
+        options: [dev, prod]
+        default: prod
+      tag:
+        description: "Image tag (e.g. 0.3.2). Empty = latest semver tag"
+        type: string
+        required: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      OPENCLAW_GATEWAY_TOKEN: ${{ secrets.OPENCLAW_GATEWAY_TOKEN }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PROXY_URL: ${{ secrets.PROXY_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute deploy variables
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ENV="${{ inputs.environment }}"
+          TAG_INPUT="${{ inputs.tag }}"
+
+          if [ -z "${TAG_INPUT}" ]; then
+            git fetch --tags --force >/dev/null 2>&1 || true
+            TAG="$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+            [ -z "$TAG" ] && { echo "No semver tags found" >&2; exit 1; }
+          else
+            TAG="$TAG_INPUT"
+          fi
+
+          REPO="${{ github.repository }}"
+          REPO_LOWER="${REPO,,}"
+          IMAGE_OWNER="${REPO_LOWER%%/*}"
+          IMAGE_REPO="${REPO_LOWER##*/}"
+
+          echo "env=$ENV" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "registry=ghcr.io" >> "$GITHUB_OUTPUT"
+          echo "image_owner=$IMAGE_OWNER" >> "$GITHUB_OUTPUT"
+          echo "image_repo=$IMAGE_REPO" >> "$GITHUB_OUTPUT"
+
+      - name: Locate compose file
+        id: paths
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ENV="${{ steps.vars.outputs.env }}"
+          if [ "$ENV" = "dev" ]; then
+            COMPOSE="$(find . -type f \( -name "docker-compose.dev.yml" -o -name "docker-compose.yml" \) | sort | head -n1 || true)"
+          else
+            COMPOSE="$(find . -type f -name "docker-compose.${ENV}.yml" | head -n1 || true)"
+          fi
+
+          if [ -z "$COMPOSE" ]; then
+            echo "Cannot find compose file for env=$ENV in repo" >&2
+            find . -maxdepth 3 -type f -print
+            exit 1
+          fi
+
+          CONFIG_FILE="$(find . -type f -path "*/.docker/openclaw/openclaw.json" | head -n1 || true)"
+          if [ -z "$CONFIG_FILE" ]; then
+            echo "Cannot find .docker/openclaw/openclaw.json in repo" >&2
+            exit 1
+          fi
+
+          echo "compose=$COMPOSE" >> "$GITHUB_OUTPUT"
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare remote dir
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.SSH_HOST }}
+          username: ${{ env.SSH_USER }}
+          key: ${{ env.SSH_PRIVATE_KEY }}
+          port: ${{ env.SSH_PORT || 22 }}
+          script: |
+            set -euo pipefail
+            mkdir -p ~/${{ steps.vars.outputs.image_repo }}/compose
+            mkdir -p ~/${{ steps.vars.outputs.image_repo }}/config
+            mkdir -p ~/${{ steps.vars.outputs.image_repo }}/state/openclaw
+            mkdir -p ~/${{ steps.vars.outputs.image_repo }}/state/workspace
+
+      - name: Copy compose to remote
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ env.SSH_HOST }}
+          username: ${{ env.SSH_USER }}
+          key: ${{ env.SSH_PRIVATE_KEY }}
+          port: ${{ env.SSH_PORT || 22 }}
+          source: "${{ steps.paths.outputs.compose }},${{ steps.paths.outputs.config_file }}"
+          target: ~/${{ steps.vars.outputs.image_repo }}
+          overwrite: true
+          strip_components: 0
+          timeout: 30s
+          command_timeout: 10m
+          debug: true
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          ENV: ${{ steps.vars.outputs.env }}
+          TAG: ${{ steps.vars.outputs.tag }}
+          REGISTRY: ${{ steps.vars.outputs.registry }}
+          IMAGE_OWNER: ${{ steps.vars.outputs.image_owner }}
+          IMAGE_REPO: ${{ steps.vars.outputs.image_repo }}
+          GHCR_USERNAME: ${{ env.GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ env.GHCR_TOKEN }}
+          OPENCLAW_GATEWAY_TOKEN: ${{ env.OPENCLAW_GATEWAY_TOKEN }}
+          OPENAI_API_KEY: ${{ env.OPENAI_API_KEY }}
+          PROXY_URL: ${{ env.PROXY_URL }}
+        with:
+          host: ${{ env.SSH_HOST }}
+          username: ${{ env.SSH_USER }}
+          key: ${{ env.SSH_PRIVATE_KEY }}
+          port: ${{ env.SSH_PORT || 22 }}
+          envs: >
+            ENV,TAG,REGISTRY,IMAGE_OWNER,IMAGE_REPO,GHCR_USERNAME,GHCR_TOKEN,OPENCLAW_GATEWAY_TOKEN,OPENAI_API_KEY,PROXY_URL
+          script: |
+            set -euo pipefail
+
+            : "${IMAGE_REPO:?missing}"
+            : "${ENV:?missing}"
+            : "${OPENCLAW_GATEWAY_TOKEN:?missing}"
+            : "${OPENAI_API_KEY:?missing}"
+
+            APP_DIR="${HOME}/${IMAGE_REPO}"
+            COMPOSE_DIR="${APP_DIR}/compose"
+            CONFIG_SOURCE="$(find "${APP_DIR}" -type f -path "*/.docker/openclaw/openclaw.json" | head -n1 || true)"
+            CONFIG_DIR="${APP_DIR}/state/openclaw"
+            WORKSPACE_DIR="${APP_DIR}/state/workspace"
+
+            mkdir -p "${COMPOSE_DIR}" "${CONFIG_DIR}" "${WORKSPACE_DIR}"
+
+            COMPOSE_FILE="$(find "${APP_DIR}" -type f \( -name "docker-compose.${ENV}.yml" -o -name "docker-compose.yml" \) | sort | head -n1 || true)"
+            [ -f "${COMPOSE_FILE}" ] || { echo "Missing compose file for ${ENV}"; find "${APP_DIR}" -maxdepth 4 -type f -print; exit 1; }
+
+            cp -f "${COMPOSE_FILE}" "${COMPOSE_DIR}/$(basename "${COMPOSE_FILE}")"
+            COMPOSE_BASENAME="$(basename "${COMPOSE_FILE}")"
+
+            if [ -n "${CONFIG_SOURCE}" ] && [ -f "${CONFIG_SOURCE}" ]; then
+              cp -f "${CONFIG_SOURCE}" "${CONFIG_DIR}/openclaw.json"
+            fi
+            [ -f "${CONFIG_DIR}/openclaw.json" ] || { echo "Missing openclaw.json"; find "${APP_DIR}" -maxdepth 5 -type f -print; exit 1; }
+
+            export REGISTRY="${REGISTRY:-ghcr.io}"
+            export IMAGE_OWNER="${IMAGE_OWNER:?IMAGE_OWNER is required}"
+            export IMAGE_REPO="${IMAGE_REPO:?IMAGE_REPO is required}"
+            export TAG="${TAG:-latest}"
+
+            ENVFILE="${COMPOSE_DIR}/.env.${ENV}"
+            umask 077
+            HTTP_PROXY_VALUE=""
+            HTTPS_PROXY_VALUE=""
+            ALL_PROXY_VALUE=""
+            OPENCLAW_HTTP_PROXY_VALUE=""
+            OPENCLAW_HTTPS_PROXY_VALUE=""
+            OPENCLAW_ALL_PROXY_VALUE=""
+            COMPOSE_PROFILES_VALUE=""
+            case "${PROXY_URL:-}" in
+              http://*|https://*)
+                HTTP_PROXY_VALUE="${PROXY_URL}"
+                HTTPS_PROXY_VALUE="${PROXY_URL}"
+                ALL_PROXY_VALUE="${PROXY_URL}"
+                ;;
+              socks5://*|socks5h://*|socks://*)
+                OPENCLAW_HTTP_PROXY_VALUE="http://openclaw-proxy-bridge:8080"
+                OPENCLAW_HTTPS_PROXY_VALUE="http://openclaw-proxy-bridge:8080"
+                OPENCLAW_ALL_PROXY_VALUE="http://openclaw-proxy-bridge:8080"
+                COMPOSE_PROFILES_VALUE="proxy-bridge"
+                ;;
+            esac
+
+            cat > "${ENVFILE}" <<EOF
+            REGISTRY=${REGISTRY}
+            IMAGE_OWNER=${IMAGE_OWNER}
+            IMAGE_REPO=${IMAGE_REPO}
+            TAG=${TAG}
+            OPENCLAW_IMAGE=${REGISTRY}/${IMAGE_OWNER}/${IMAGE_REPO}:${TAG}
+            OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
+            OPENAI_API_KEY=${OPENAI_API_KEY}
+            PROXY_URL=${PROXY_URL}
+            HTTP_PROXY=${HTTP_PROXY_VALUE}
+            HTTPS_PROXY=${HTTPS_PROXY_VALUE}
+            ALL_PROXY=${ALL_PROXY_VALUE}
+            OPENCLAW_HTTP_PROXY=${OPENCLAW_HTTP_PROXY_VALUE}
+            OPENCLAW_HTTPS_PROXY=${OPENCLAW_HTTPS_PROXY_VALUE}
+            OPENCLAW_ALL_PROXY=${OPENCLAW_ALL_PROXY_VALUE}
+            COMPOSE_PROFILES=${COMPOSE_PROFILES_VALUE}
+            NO_PROXY=localhost,127.0.0.1,openclaw-gateway
+            OPENCLAW_CONFIG_DIR=${CONFIG_DIR}
+            OPENCLAW_WORKSPACE_DIR=${WORKSPACE_DIR}
+            OPENCLAW_GATEWAY_PORT=18789
+            OPENCLAW_BRIDGE_PORT=18790
+            OPENCLAW_GATEWAY_BIND=lan
+            OPENCLAW_EXTRA_MOUNTS=
+            OPENCLAW_HOME_VOLUME=
+            OPENCLAW_DOCKER_APT_PACKAGES=
+            OPENCLAW_SANDBOX=
+            OPENCLAW_DOCKER_SOCKET=/var/run/docker.sock
+            DOCKER_GID=
+            OPENCLAW_INSTALL_DOCKER_CLI=
+            OPENCLAW_ALLOW_INSECURE_PRIVATE_WS=
+            EOF
+
+            if [ -n "${GHCR_USERNAME:-}" ] && [ -n "${GHCR_TOKEN:-}" ]; then
+              echo "${GHCR_TOKEN}" | sudo docker login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
+            fi
+
+            cd "${COMPOSE_DIR}"
+
+            echo "Using image ${REGISTRY}/${IMAGE_OWNER}/${IMAGE_REPO}:${TAG}"
+
+            sudo docker compose -p "${IMAGE_REPO}-${ENV}" -f "${COMPOSE_BASENAME}" --env-file "${ENVFILE}" pull
+            sudo docker compose -p "${IMAGE_REPO}-${ENV}" -f "${COMPOSE_BASENAME}" --env-file "${ENVFILE}" up -d --remove-orphans
+            sudo docker compose -p "${IMAGE_REPO}-${ENV}" -f "${COMPOSE_BASENAME}" --env-file "${ENVFILE}" ps
