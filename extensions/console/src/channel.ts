@@ -1,12 +1,16 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import path from "node:path";
 import {
   buildChannelConfigSchema,
   createAccountListHelpers,
   DEFAULT_ACCOUNT_ID,
+  readJsonFileWithFallback,
   registerPluginHttpRoute,
   readJsonWebhookBodyOrReject,
   setAccountEnabledInConfigSection,
+  withFileLock,
   waitUntilAbort,
+  writeJsonFileAtomically,
   type ChannelGatewayContext,
   type ChannelPlugin,
 } from "openclaw/plugin-sdk";
@@ -18,6 +22,17 @@ const CHANNEL_ID = "console";
 const DEFAULT_WEBHOOK_PATH = "/console";
 const DEFAULT_SESSION_KEY = "main";
 const DEFAULT_SENDER_ID = "console-user";
+const PROMPT_STORE_FILE = "session-prompts.json";
+const PROMPT_STORE_LOCK_OPTIONS = {
+  retries: {
+    retries: 10,
+    factor: 2,
+    minTimeout: 100,
+    maxTimeout: 10_000,
+    randomize: true,
+  },
+  stale: 30_000,
+} as const;
 
 type ConsoleAccountConfig = {
   enabled?: boolean;
@@ -70,6 +85,8 @@ type ConsoleCallbackBody = {
     media: ConsoleCallbackMedia[];
   };
 };
+
+type ConsolePromptStore = Record<string, string>;
 
 const accountHelpers = createAccountListHelpers(CHANNEL_ID);
 const ConsoleConfigSchema = buildChannelConfigSchema(
@@ -125,6 +142,15 @@ function normalizeWebhookPath(value: string): string {
     return DEFAULT_WEBHOOK_PATH;
   }
   return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+}
+
+export function buildConsoleRoutePath(basePath: string, suffix?: string): string {
+  const normalizedBase = normalizeWebhookPath(basePath).replace(/\/+$/, "") || DEFAULT_WEBHOOK_PATH;
+  if (!suffix) {
+    return normalizedBase;
+  }
+  const normalizedSuffix = suffix.replace(/^\/+/, "");
+  return `${normalizedBase}/${normalizedSuffix}`;
 }
 
 function readHeaderValue(value: string | string[] | undefined): string | undefined {
@@ -232,11 +258,105 @@ function parseConsoleInboundBody(value: unknown): ConsoleInboundBody {
   };
 }
 
-function buildConsoleInboundContext(params: {
+function parseConsolePromptSetBody(value: unknown): { sessionKey: string; systemPrompt: string } {
+  if (!value || typeof value !== "object") {
+    throw new Error("request body must be a JSON object");
+  }
+  const body = value as Record<string, unknown>;
+  const sessionKey = readOptionalString(body.sessionKey);
+  if (!sessionKey) {
+    throw new Error('request body must include "sessionKey"');
+  }
+  const systemPrompt = readOptionalString(body.systemPrompt);
+  if (!systemPrompt) {
+    throw new Error('request body must include "systemPrompt"');
+  }
+  return { sessionKey, systemPrompt };
+}
+
+function parseConsolePromptSessionKey(value: unknown): { sessionKey: string } {
+  if (!value || typeof value !== "object") {
+    throw new Error("request body must be a JSON object");
+  }
+  const body = value as Record<string, unknown>;
+  const sessionKey = readOptionalString(body.sessionKey);
+  if (!sessionKey) {
+    throw new Error('request body must include "sessionKey"');
+  }
+  return { sessionKey };
+}
+
+function normalizeConsolePromptStore(value: unknown): ConsolePromptStore {
+  if (!value || typeof value !== "object") {
+    return {};
+  }
+  const store = value as Record<string, unknown>;
+  const normalized: ConsolePromptStore = {};
+  for (const [key, entry] of Object.entries(store)) {
+    const normalizedKey = key.trim();
+    const normalizedValue = readOptionalString(entry);
+    if (!normalizedKey || !normalizedValue) {
+      continue;
+    }
+    normalized[normalizedKey] = normalizedValue;
+  }
+  return normalized;
+}
+
+function resolveConsolePromptStorePath(): string {
+  return path.join(
+    getConsoleRuntime().state.resolveStateDir(),
+    "plugins",
+    CHANNEL_ID,
+    PROMPT_STORE_FILE,
+  );
+}
+
+async function withConsolePromptStore<T>(
+  task: (store: ConsolePromptStore, filePath: string) => Promise<T>,
+): Promise<T> {
+  const filePath = resolveConsolePromptStorePath();
+  const { exists } = await readJsonFileWithFallback<ConsolePromptStore>(filePath, {});
+  if (!exists) {
+    await writeJsonFileAtomically(filePath, {});
+  }
+  return await withFileLock(filePath, PROMPT_STORE_LOCK_OPTIONS, async () => {
+    const { value } = await readJsonFileWithFallback<ConsolePromptStore>(filePath, {});
+    return await task(normalizeConsolePromptStore(value), filePath);
+  });
+}
+
+export async function getConsoleSessionPrompt(sessionKey: string): Promise<string | undefined> {
+  return await withConsolePromptStore(async (store) => store[sessionKey]);
+}
+
+export async function setConsoleSessionPrompt(params: {
+  sessionKey: string;
+  systemPrompt: string;
+}): Promise<void> {
+  await withConsolePromptStore(async (store, filePath) => {
+    store[params.sessionKey] = params.systemPrompt;
+    await writeJsonFileAtomically(filePath, store);
+  });
+}
+
+export async function clearConsoleSessionPrompt(sessionKey: string): Promise<boolean> {
+  return await withConsolePromptStore(async (store, filePath) => {
+    if (!(sessionKey in store)) {
+      return false;
+    }
+    delete store[sessionKey];
+    await writeJsonFileAtomically(filePath, store);
+    return true;
+  });
+}
+
+export function buildConsoleInboundContext(params: {
   account: ResolvedConsoleAccount;
   body: ConsoleInboundBody;
+  systemPrompt?: string;
 }) {
-  const { account, body } = params;
+  const { account, body, systemPrompt } = params;
   return {
     Body: body.text,
     BodyForAgent: body.text,
@@ -257,6 +377,7 @@ function buildConsoleInboundContext(params: {
     ChatType: "direct",
     SenderName: body.senderName,
     SenderId: body.senderId,
+    GroupSystemPrompt: systemPrompt,
     Provider: CHANNEL_ID,
     Surface: CHANNEL_ID,
     ConversationLabel: body.senderName ?? body.conversationId,
@@ -396,10 +517,12 @@ function createConsoleWebhookHandler(params: {
     const payloads: ConsoleReplyPayload[] = [];
 
     try {
+      const systemPrompt = await getConsoleSessionPrompt(inboundBody.sessionKey);
       await params.channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
         ctx: buildConsoleInboundContext({
           account: params.account,
           body: inboundBody,
+          ...(systemPrompt ? { systemPrompt } : {}),
         }),
         cfg: runtime.config.loadConfig(),
         dispatcherOptions: {
@@ -432,6 +555,200 @@ function createConsoleWebhookHandler(params: {
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.end(JSON.stringify({ ok: true }));
     return true;
+  };
+}
+
+function createConsolePromptSetHandler(params: {
+  account: ResolvedConsoleAccount;
+  log?: {
+    info?: (message: string) => void;
+    warn?: (message: string) => void;
+    error?: (message: string) => void;
+  };
+}) {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    if ((req.method ?? "GET") !== "POST") {
+      res.statusCode = 405;
+      res.setHeader("Allow", "POST");
+      res.end("Method Not Allowed");
+      return true;
+    }
+
+    const contentType = readHeaderValue(req.headers["content-type"]) ?? "";
+    if (!contentType.toLowerCase().includes("json")) {
+      res.statusCode = 415;
+      res.end("Unsupported Media Type");
+      return true;
+    }
+
+    const jsonBody = await readJsonWebhookBodyOrReject({
+      req,
+      res,
+      emptyObjectOnEmpty: false,
+      invalidJsonMessage: "Invalid JSON body",
+    });
+    if (!jsonBody.ok) {
+      return true;
+    }
+
+    let body: { sessionKey: string; systemPrompt: string };
+    try {
+      body = parseConsolePromptSetBody(jsonBody.value);
+    } catch (error) {
+      res.statusCode = 400;
+      res.end(error instanceof Error ? error.message : "Invalid request body");
+      return true;
+    }
+
+    try {
+      await setConsoleSessionPrompt(body);
+    } catch (error) {
+      params.log?.error?.(`console: failed to store system prompt: ${String(error)}`);
+      res.statusCode = 500;
+      res.end("Failed to store system prompt");
+      return true;
+    }
+
+    params.log?.info?.(
+      `console: stored system prompt for ${body.sessionKey} (${params.account.accountId})`,
+    );
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.end(JSON.stringify({ ok: true, sessionKey: body.sessionKey, hasPrompt: true }));
+    return true;
+  };
+}
+
+function createConsolePromptGetHandler(params: {
+  account: ResolvedConsoleAccount;
+  log?: {
+    info?: (message: string) => void;
+    warn?: (message: string) => void;
+    error?: (message: string) => void;
+  };
+}) {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    const method = req.method ?? "GET";
+    let sessionKey: string | undefined;
+
+    if (method === "GET") {
+      const requestUrl = new URL(req.url ?? "/", "http://localhost");
+      sessionKey = readOptionalString(requestUrl.searchParams.get("sessionKey"));
+    } else if (method === "POST") {
+      const contentType = readHeaderValue(req.headers["content-type"]) ?? "";
+      if (!contentType.toLowerCase().includes("json")) {
+        res.statusCode = 415;
+        res.end("Unsupported Media Type");
+        return true;
+      }
+      const jsonBody = await readJsonWebhookBodyOrReject({
+        req,
+        res,
+        emptyObjectOnEmpty: false,
+        invalidJsonMessage: "Invalid JSON body",
+      });
+      if (!jsonBody.ok) {
+        return true;
+      }
+      try {
+        sessionKey = parseConsolePromptSessionKey(jsonBody.value).sessionKey;
+      } catch (error) {
+        res.statusCode = 400;
+        res.end(error instanceof Error ? error.message : "Invalid request body");
+        return true;
+      }
+    } else {
+      res.statusCode = 405;
+      res.setHeader("Allow", "GET, POST");
+      res.end("Method Not Allowed");
+      return true;
+    }
+
+    if (!sessionKey) {
+      res.statusCode = 400;
+      res.end('request must include "sessionKey"');
+      return true;
+    }
+
+    try {
+      const systemPrompt = await getConsoleSessionPrompt(sessionKey);
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.end(
+        JSON.stringify({
+          ok: true,
+          sessionKey,
+          systemPrompt: systemPrompt ?? null,
+          hasPrompt: Boolean(systemPrompt),
+        }),
+      );
+      return true;
+    } catch (error) {
+      params.log?.error?.(`console: failed to read system prompt: ${String(error)}`);
+      res.statusCode = 500;
+      res.end("Failed to read system prompt");
+      return true;
+    }
+  };
+}
+
+function createConsolePromptClearHandler(params: {
+  account: ResolvedConsoleAccount;
+  log?: {
+    info?: (message: string) => void;
+    warn?: (message: string) => void;
+    error?: (message: string) => void;
+  };
+}) {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    if ((req.method ?? "GET") !== "POST") {
+      res.statusCode = 405;
+      res.setHeader("Allow", "POST");
+      res.end("Method Not Allowed");
+      return true;
+    }
+
+    const contentType = readHeaderValue(req.headers["content-type"]) ?? "";
+    if (!contentType.toLowerCase().includes("json")) {
+      res.statusCode = 415;
+      res.end("Unsupported Media Type");
+      return true;
+    }
+
+    const jsonBody = await readJsonWebhookBodyOrReject({
+      req,
+      res,
+      emptyObjectOnEmpty: false,
+      invalidJsonMessage: "Invalid JSON body",
+    });
+    if (!jsonBody.ok) {
+      return true;
+    }
+
+    let body: { sessionKey: string };
+    try {
+      body = parseConsolePromptSessionKey(jsonBody.value);
+    } catch (error) {
+      res.statusCode = 400;
+      res.end(error instanceof Error ? error.message : "Invalid request body");
+      return true;
+    }
+
+    try {
+      const cleared = await clearConsoleSessionPrompt(body.sessionKey);
+      params.log?.info?.(
+        `console: cleared system prompt for ${body.sessionKey} (${params.account.accountId})`,
+      );
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.end(JSON.stringify({ ok: true, sessionKey: body.sessionKey, cleared }));
+      return true;
+    } catch (error) {
+      params.log?.error?.(`console: failed to clear system prompt: ${String(error)}`);
+      res.statusCode = 500;
+      res.end("Failed to clear system prompt");
+      return true;
+    }
   };
 }
 
@@ -480,24 +797,44 @@ export const consolePlugin: ChannelPlugin<ResolvedConsoleAccount> = {
       }
 
       const account = ctx.account;
-      const routeKey = `${account.accountId}:${account.webhookPath}`;
-      activeRouteUnregisters.get(routeKey)?.();
+      const routes = [
+        {
+          path: buildConsoleRoutePath(account.webhookPath),
+          handler: createConsoleWebhookHandler({
+            account,
+            channelRuntime: ctx.channelRuntime,
+            log: ctx.log,
+          }),
+        },
+        {
+          path: buildConsoleRoutePath(account.webhookPath, "setPrompt"),
+          handler: createConsolePromptSetHandler({ account, log: ctx.log }),
+        },
+        {
+          path: buildConsoleRoutePath(account.webhookPath, "getPrompt"),
+          handler: createConsolePromptGetHandler({ account, log: ctx.log }),
+        },
+        {
+          path: buildConsoleRoutePath(account.webhookPath, "clearPrompt"),
+          handler: createConsolePromptClearHandler({ account, log: ctx.log }),
+        },
+      ];
 
-      const unregister = registerPluginHttpRoute({
-        path: account.webhookPath,
-        auth: "plugin",
-        replaceExisting: true,
-        pluginId: CHANNEL_ID,
-        accountId: account.accountId,
-        log: (message) => ctx.log?.info?.(message),
-        handler: createConsoleWebhookHandler({
-          account,
-          channelRuntime: ctx.channelRuntime,
-          log: ctx.log,
-        }),
-      });
+      for (const route of routes) {
+        const routeKey = `${account.accountId}:${route.path}`;
+        activeRouteUnregisters.get(routeKey)?.();
+        const unregister = registerPluginHttpRoute({
+          path: route.path,
+          auth: "plugin",
+          replaceExisting: true,
+          pluginId: CHANNEL_ID,
+          accountId: account.accountId,
+          log: (message) => ctx.log?.info?.(message),
+          handler: route.handler,
+        });
+        activeRouteUnregisters.set(routeKey, unregister);
+      }
 
-      activeRouteUnregisters.set(routeKey, unregister);
       ctx.setStatus({
         accountId: account.accountId,
         configured: true,
@@ -505,13 +842,16 @@ export const consolePlugin: ChannelPlugin<ResolvedConsoleAccount> = {
         running: true,
       });
       ctx.log?.info?.(
-        `console: registered HTTP route ${account.webhookPath} for account ${account.accountId}`,
+        `console: registered HTTP routes for account ${account.accountId} on ${account.webhookPath}`,
       );
 
       await waitUntilAbort(ctx.abortSignal);
 
-      unregister();
-      activeRouteUnregisters.delete(routeKey);
+      for (const route of routes) {
+        const routeKey = `${account.accountId}:${route.path}`;
+        activeRouteUnregisters.get(routeKey)?.();
+        activeRouteUnregisters.delete(routeKey);
+      }
       ctx.setStatus({
         accountId: account.accountId,
         configured: true,
