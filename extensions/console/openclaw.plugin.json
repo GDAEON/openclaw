@@ -1,0 +1,9 @@
+{
+  "id": "console",
+  "channels": ["console"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

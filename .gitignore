@@ -2,6 +2,8 @@ node_modules
 **/node_modules/
 .env
 docker-compose.extra.yml
+docker-compose.sandbox.yml
+.docker/
 dist
 pnpm-lock.yaml
 bun.lock
