@@ -172,12 +172,14 @@ jobs:
 
             if [ -n "${CONFIG_SOURCE}" ] && [ -f "${CONFIG_SOURCE}" ]; then
               if [ "${CONFIG_SOURCE}" != "${CONFIG_DIR}/openclaw.json" ]; then
-                cp -f "${CONFIG_SOURCE}" "${CONFIG_DIR}/openclaw.json"
+                sudo cp -f "${CONFIG_SOURCE}" "${CONFIG_DIR}/openclaw.json"
               fi
             fi
+            sudo chown -R 1000:1000 "${CONFIG_DIR}" "${WORKSPACE_DIR}"
+            sudo chmod -R u+rwX "${CONFIG_DIR}" "${WORKSPACE_DIR}"
             sudo chown 1000:1000 "${CONFIG_DIR}/openclaw.json" 2>/dev/null || true
             sudo chmod u+rw "${CONFIG_DIR}/openclaw.json" 2>/dev/null || true
-            [ -f "${CONFIG_DIR}/openclaw.json" ] || { echo "Missing openclaw.json"; find "${APP_DIR}" -maxdepth 5 -type f -print; exit 1; }
+            [ -f "${CONFIG_DIR}/openclaw.json" ] || { echo "Missing openclaw.json"; sudo find "${APP_DIR}" -maxdepth 5 -type f -print; exit 1; }
 
             export REGISTRY="${REGISTRY:-ghcr.io}"
             export IMAGE_OWNER="${IMAGE_OWNER:?IMAGE_OWNER is required}"
