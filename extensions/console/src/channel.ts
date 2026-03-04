@@ -453,6 +453,49 @@ async function postConsoleCallback(params: {
   }
 }
 
+async function processConsoleWebhookRequest(params: {
+  account: ResolvedConsoleAccount;
+  callbackUrl: string;
+  body: ConsoleInboundBody;
+  channelRuntime: NonNullable<ChannelGatewayContext<ResolvedConsoleAccount>["channelRuntime"]>;
+  log?: {
+    info?: (message: string) => void;
+    warn?: (message: string) => void;
+    error?: (message: string) => void;
+  };
+}) {
+  const runtime = getConsoleRuntime();
+  const payloads: ConsoleReplyPayload[] = [];
+  const systemPrompt = await getConsoleSessionPrompt(params.body.sessionKey);
+
+  await params.channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx: buildConsoleInboundContext({
+      account: params.account,
+      body: params.body,
+      ...(systemPrompt ? { systemPrompt } : {}),
+    }),
+    cfg: runtime.config.loadConfig(),
+    dispatcherOptions: {
+      deliver: async (payload) => {
+        payloads.push(payload as ConsoleReplyPayload);
+      },
+      onReplyStart: () => {
+        params.log?.info?.(
+          `console: reply started for ${params.body.conversationId} (${params.account.accountId})`,
+        );
+      },
+      onError: (error, info) => {
+        params.log?.error?.(`console: ${info.kind} reply failed: ${String(error)}`);
+      },
+    },
+  });
+
+  await postConsoleCallback({
+    callbackUrl: params.callbackUrl,
+    payloads,
+  });
+}
+
 function createConsoleWebhookHandler(params: {
   account: ResolvedConsoleAccount;
   channelRuntime: NonNullable<ChannelGatewayContext<ResolvedConsoleAccount>["channelRuntime"]>;
@@ -513,47 +556,23 @@ function createConsoleWebhookHandler(params: {
       return true;
     }
 
-    const runtime = getConsoleRuntime();
-    const payloads: ConsoleReplyPayload[] = [];
-
-    try {
-      const systemPrompt = await getConsoleSessionPrompt(inboundBody.sessionKey);
-      await params.channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
-        ctx: buildConsoleInboundContext({
-          account: params.account,
-          body: inboundBody,
-          ...(systemPrompt ? { systemPrompt } : {}),
-        }),
-        cfg: runtime.config.loadConfig(),
-        dispatcherOptions: {
-          deliver: async (payload) => {
-            payloads.push(payload as ConsoleReplyPayload);
-          },
-          onReplyStart: () => {
-            params.log?.info?.(
-              `console: reply started for ${inboundBody.conversationId} (${params.account.accountId})`,
-            );
-          },
-          onError: (error, info) => {
-            params.log?.error?.(`console: ${info.kind} reply failed: ${String(error)}`);
-          },
-        },
-      });
-
-      await postConsoleCallback({
-        callbackUrl,
-        payloads,
-      });
-    } catch (error) {
-      params.log?.error?.(`console: inbound request failed: ${String(error)}`);
-      res.statusCode = 500;
-      res.end("Console request failed");
-      return true;
-    }
-
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.end(JSON.stringify({ ok: true }));
+    res.end(JSON.stringify({ ok: true, accepted: true }));
+
+    void processConsoleWebhookRequest({
+      account: params.account,
+      callbackUrl,
+      body: inboundBody,
+      channelRuntime: params.channelRuntime,
+      log: params.log,
+    }).catch((error) => {
+      params.log?.error?.(`console: inbound request failed: ${String(error)}`);
+      params.log?.warn?.(
+        `console: request for ${inboundBody.conversationId} was accepted but callback failed`,
+      );
+    });
+
     return true;
   };
 }
