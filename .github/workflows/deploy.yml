@@ -101,10 +101,13 @@ jobs:
           port: ${{ env.SSH_PORT || 22 }}
           script: |
             set -euo pipefail
-            mkdir -p ~/${{ steps.vars.outputs.image_repo }}/compose
-            mkdir -p ~/${{ steps.vars.outputs.image_repo }}/config
-            mkdir -p ~/${{ steps.vars.outputs.image_repo }}/state/openclaw
-            mkdir -p ~/${{ steps.vars.outputs.image_repo }}/state/workspace
+            APP_DIR=~/${{ steps.vars.outputs.image_repo }}
+            mkdir -p "${APP_DIR}/compose"
+            mkdir -p "${APP_DIR}/config"
+            mkdir -p "${APP_DIR}/state/openclaw"
+            mkdir -p "${APP_DIR}/state/workspace"
+            sudo chown -R 1000:1000 "${APP_DIR}/state/openclaw" "${APP_DIR}/state/workspace"
+            sudo chmod -R u+rwX "${APP_DIR}/state/openclaw" "${APP_DIR}/state/workspace"
 
       - name: Copy compose to remote
         uses: appleboy/scp-action@v0.1.7
@@ -156,6 +159,8 @@ jobs:
             WORKSPACE_DIR="${APP_DIR}/state/workspace"
 
             mkdir -p "${COMPOSE_DIR}" "${CONFIG_DIR}" "${WORKSPACE_DIR}"
+            sudo chown -R 1000:1000 "${CONFIG_DIR}" "${WORKSPACE_DIR}"
+            sudo chmod -R u+rwX "${CONFIG_DIR}" "${WORKSPACE_DIR}"
 
             COMPOSE_FILE="$(find "${APP_DIR}" -type f \( -name "docker-compose.${ENV}.yml" -o -name "docker-compose.yml" \) | sort | head -n1 || true)"
             [ -f "${COMPOSE_FILE}" ] || { echo "Missing compose file for ${ENV}"; find "${APP_DIR}" -maxdepth 4 -type f -print; exit 1; }
@@ -170,6 +175,8 @@ jobs:
                 cp -f "${CONFIG_SOURCE}" "${CONFIG_DIR}/openclaw.json"
               fi
             fi
+            sudo chown 1000:1000 "${CONFIG_DIR}/openclaw.json" 2>/dev/null || true
+            sudo chmod u+rw "${CONFIG_DIR}/openclaw.json" 2>/dev/null || true
             [ -f "${CONFIG_DIR}/openclaw.json" ] || { echo "Missing openclaw.json"; find "${APP_DIR}" -maxdepth 5 -type f -print; exit 1; }
 
             export REGISTRY="${REGISTRY:-ghcr.io}"
