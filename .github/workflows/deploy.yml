@@ -30,10 +30,10 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       PROXY_URL: ${{ secrets.PROXY_URL }}
       BILLING_BEARER: ${{ secrets.BILLING_BEARER }}
-      AI_DELIVERY_BASE_URL: ${{ secrets.AI_DELIVERY_BASE_URL }}
-      AI_DELIVERY_TEST_BASE_URL: ${{ secrets.AI_DELIVERY_TEST_BASE_URL }}
-      EXCHANGE_API_URL: ${{ secrets.EXCHANGE_API_URL }}
-      PRICE: ${{ secrets.PRICE }}
+      AI_DELIVERY_BASE_URL: ${{ vars.AI_DELIVERY_BASE_URL }}
+      AI_DELIVERY_TEST_BASE_URL: ${{ vars.AI_DELIVERY_TEST_BASE_URL }}
+      EXCHANGE_API_URL: ${{ vars.EXCHANGE_API_URL }}
+      PRICE: ${{ vars.PRICE }}
 
     steps:
       - name: Checkout
