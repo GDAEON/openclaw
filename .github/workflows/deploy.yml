@@ -29,11 +29,11 @@ jobs:
       OPENCLAW_GATEWAY_TOKEN: ${{ secrets.OPENCLAW_GATEWAY_TOKEN }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       PROXY_URL: ${{ secrets.PROXY_URL }}
-      BILLING_BEARER: ${{ secrets.BILLING_BEARER }}
-      AI_DELIVERY_BASE_URL: ${{ vars.AI_DELIVERY_BASE_URL }}
-      AI_DELIVERY_TEST_BASE_URL: ${{ vars.AI_DELIVERY_TEST_BASE_URL }}
-      EXCHANGE_API_URL: ${{ vars.EXCHANGE_API_URL }}
-      PRICE: ${{ vars.PRICE }}
+      BILLING_BEARER: ${{ secrets.BILLING_BEARER || vars.BILLING_BEARER }}
+      AI_DELIVERY_BASE_URL: ${{ vars.AI_DELIVERY_BASE_URL || secrets.AI_DELIVERY_BASE_URL }}
+      AI_DELIVERY_TEST_BASE_URL: ${{ vars.AI_DELIVERY_TEST_BASE_URL || secrets.AI_DELIVERY_TEST_BASE_URL }}
+      EXCHANGE_API_URL: ${{ vars.EXCHANGE_API_URL || secrets.EXCHANGE_API_URL }}
+      PRICE: ${{ vars.PRICE || secrets.PRICE }}
 
     steps:
       - name: Checkout
@@ -219,6 +219,18 @@ jobs:
                 ;;
             esac
 
+            has_billing_bearer=0
+            has_ai_delivery_base=0
+            has_ai_delivery_test_base=0
+            has_exchange_api=0
+            has_price=0
+            [ -n "${BILLING_BEARER:-}" ] && has_billing_bearer=1
+            [ -n "${AI_DELIVERY_BASE_URL:-}" ] && has_ai_delivery_base=1
+            [ -n "${AI_DELIVERY_TEST_BASE_URL:-}" ] && has_ai_delivery_test_base=1
+            [ -n "${EXCHANGE_API_URL:-}" ] && has_exchange_api=1
+            [ -n "${PRICE:-}" ] && has_price=1
+            echo "billing env presence: BILLING_BEARER=${has_billing_bearer} AI_DELIVERY_BASE_URL=${has_ai_delivery_base} AI_DELIVERY_TEST_BASE_URL=${has_ai_delivery_test_base} EXCHANGE_API_URL=${has_exchange_api} PRICE=${has_price}"
+
             cat > "${ENVFILE}" <<EOF
             REGISTRY=${REGISTRY}
             IMAGE_OWNER=${IMAGE_OWNER}
@@ -255,6 +267,9 @@ jobs:
             EXCHANGE_API_URL=${EXCHANGE_API_URL}
             PRICE=${PRICE}
             EOF
+
+            echo "envfile keys check:"
+            grep -E '^(BILLING_BEARER|AI_DELIVERY_BASE_URL|AI_DELIVERY_TEST_BASE_URL|EXCHANGE_API_URL|PRICE)=' "${ENVFILE}" | sed -E 's/=.*/=<set-or-empty>/'
 
             if [ -n "${GHCR_USERNAME:-}" ] && [ -n "${GHCR_TOKEN:-}" ]; then
               echo "${GHCR_TOKEN}" | sudo docker login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
