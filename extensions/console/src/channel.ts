@@ -468,14 +468,19 @@ async function isConsoleBillingActive(params: {
 }
 
 function resolveBotMarketingBaseUrl(integration: string): string | undefined {
-  const normalized = integration.trim();
+  const normalized = integration.trim().toLowerCase();
   if (!normalized) {
     return undefined;
   }
-  if (normalized === "ai_delivery") {
+  if (normalized === "ai_delivery" || normalized === "ai-delivery") {
     return process.env.ai_delivery_base_url?.trim() || process.env.AI_DELIVERY_BASE_URL?.trim();
   }
-  if (normalized === "ai_delivery_test") {
+  if (
+    normalized === "ai_delivery_test" ||
+    normalized === "ai-delivery-test" ||
+    normalized === "ai_delivery-test" ||
+    normalized === "ai-delivery_test"
+  ) {
     return (
       process.env.ai_delivery_test_base_url?.trim() || process.env.AI_DELIVERY_TEST_BASE_URL?.trim()
     );

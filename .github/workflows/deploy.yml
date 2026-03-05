@@ -164,7 +164,16 @@ jobs:
 
             APP_DIR="${HOME}/${IMAGE_REPO}"
             COMPOSE_DIR="${APP_DIR}/compose"
-            CONFIG_SOURCE="$(find "${APP_DIR}" -type f \( -path "*/deploy/openclaw.prod.json" -o -path "*/config/openclaw.prod.json" -o -path "*/.docker/openclaw/openclaw.json" \) | head -n1 || true)"
+            CONFIG_SOURCE=""
+            for candidate in \
+              "${APP_DIR}/deploy/openclaw.prod.json" \
+              "${APP_DIR}/config/openclaw.prod.json" \
+              "${APP_DIR}/.docker/openclaw/openclaw.json"; do
+              if [ -f "${candidate}" ]; then
+                CONFIG_SOURCE="${candidate}"
+                break
+              fi
+            done
             CONFIG_DIR="${APP_DIR}/state/openclaw"
             WORKSPACE_DIR="${APP_DIR}/state/workspace"
 
@@ -282,3 +291,13 @@ jobs:
             sudo docker compose -p "${IMAGE_REPO}-${ENV}" -f "${COMPOSE_BASENAME}" --env-file "${ENVFILE}" pull
             sudo docker compose -p "${IMAGE_REPO}-${ENV}" -f "${COMPOSE_BASENAME}" --env-file "${ENVFILE}" up -d --remove-orphans
             sudo docker compose -p "${IMAGE_REPO}-${ENV}" -f "${COMPOSE_BASENAME}" --env-file "${ENVFILE}" ps
+
+            gateway_cid="$(sudo docker compose -p "${IMAGE_REPO}-${ENV}" -f "${COMPOSE_BASENAME}" --env-file "${ENVFILE}" ps -q openclaw-gateway)"
+            if [ -n "${gateway_cid}" ]; then
+              echo "gateway container env keys check:"
+              sudo docker inspect "${gateway_cid}" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+                | grep -E '^(BILLING_BEARER|AI_DELIVERY_BASE_URL|AI_DELIVERY_TEST_BASE_URL|EXCHANGE_API_URL|PRICE)=' \
+                | sed -E 's/=.*/=<set-or-empty>/'
+            else
+              echo "gateway container id not found for post-check"
+            fi
