@@ -300,17 +300,26 @@ function parseConsoleBotMarketingContext(
     map.set(key, value);
   }
   const app = map.get("app");
-  if (!app) {
+  const chat = map.get("chat");
+  if (!app || !chat) {
     return undefined;
   }
   const appParts = app
     .split("/")
     .map((entry) => entry.trim())
     .filter(Boolean);
-  if (appParts.length < 3) {
+  if (appParts.length < 2) {
     return undefined;
   }
-  const [integration, botId, userId] = appParts;
+  const chatParts = chat
+    .split("/")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (chatParts.length < 2) {
+    return undefined;
+  }
+  const [integration, botId] = appParts;
+  const userId = chatParts[1];
   if (!integration || !botId || !userId) {
     return undefined;
   }

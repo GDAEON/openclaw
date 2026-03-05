@@ -88,15 +88,15 @@ describe("console channel helpers", () => {
     ]);
   });
 
-  it("parses x-botmarketing-context app tuple", () => {
+  it("parses x-botmarketing-context and takes userId from chat tuple", () => {
     expect(
       parseConsoleBotMarketingContext(
-        "app=ai_delivery_test/my-bot/internal-123; chat=chat_id/chat_id/hash; project=project_id",
+        "app=ai_delivery_test/my-bot/internal-123; chat=external-1/chat-42/internal-777; project=project_id",
       ),
     ).toEqual({
       integration: "ai_delivery_test",
       botId: "my-bot",
-      userId: "internal-123",
+      userId: "chat-42",
     });
   });
 
