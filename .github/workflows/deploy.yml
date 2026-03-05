@@ -29,6 +29,11 @@ jobs:
       OPENCLAW_GATEWAY_TOKEN: ${{ secrets.OPENCLAW_GATEWAY_TOKEN }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       PROXY_URL: ${{ secrets.PROXY_URL }}
+      BILLING_BEARER: ${{ secrets.BILLING_BEARER }}
+      AI_DELIVERY_BASE_URL: ${{ secrets.AI_DELIVERY_BASE_URL }}
+      AI_DELIVERY_TEST_BASE_URL: ${{ secrets.AI_DELIVERY_TEST_BASE_URL }}
+      EXCHANGE_API_URL: ${{ secrets.EXCHANGE_API_URL }}
+      PRICE: ${{ secrets.PRICE }}
 
     steps:
       - name: Checkout
@@ -137,13 +142,18 @@ jobs:
           OPENCLAW_GATEWAY_TOKEN: ${{ env.OPENCLAW_GATEWAY_TOKEN }}
           OPENAI_API_KEY: ${{ env.OPENAI_API_KEY }}
           PROXY_URL: ${{ env.PROXY_URL }}
+          BILLING_BEARER: ${{ env.BILLING_BEARER }}
+          AI_DELIVERY_BASE_URL: ${{ env.AI_DELIVERY_BASE_URL }}
+          AI_DELIVERY_TEST_BASE_URL: ${{ env.AI_DELIVERY_TEST_BASE_URL }}
+          EXCHANGE_API_URL: ${{ env.EXCHANGE_API_URL }}
+          PRICE: ${{ env.PRICE }}
         with:
           host: ${{ env.SSH_HOST }}
           username: ${{ env.SSH_USER }}
           key: ${{ env.SSH_PRIVATE_KEY }}
           port: ${{ env.SSH_PORT || 22 }}
           envs: >
-            ENV,TAG,REGISTRY,IMAGE_OWNER,IMAGE_REPO,GHCR_USERNAME,GHCR_TOKEN,OPENCLAW_GATEWAY_TOKEN,OPENAI_API_KEY,PROXY_URL
+            ENV,TAG,REGISTRY,IMAGE_OWNER,IMAGE_REPO,GHCR_USERNAME,GHCR_TOKEN,OPENCLAW_GATEWAY_TOKEN,OPENAI_API_KEY,PROXY_URL,BILLING_BEARER,AI_DELIVERY_BASE_URL,AI_DELIVERY_TEST_BASE_URL,EXCHANGE_API_URL,PRICE
           script: |
             set -euo pipefail
 
@@ -239,6 +249,11 @@ jobs:
             DOCKER_GID=
             OPENCLAW_INSTALL_DOCKER_CLI=
             OPENCLAW_ALLOW_INSECURE_PRIVATE_WS=
+            BILLING_BEARER=${BILLING_BEARER}
+            AI_DELIVERY_BASE_URL=${AI_DELIVERY_BASE_URL}
+            AI_DELIVERY_TEST_BASE_URL=${AI_DELIVERY_TEST_BASE_URL}
+            EXCHANGE_API_URL=${EXCHANGE_API_URL}
+            PRICE=${PRICE}
             EOF
 
             if [ -n "${GHCR_USERNAME:-}" ] && [ -n "${GHCR_TOKEN:-}" ]; then

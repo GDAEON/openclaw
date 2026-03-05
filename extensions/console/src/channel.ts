@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
 import {
@@ -15,7 +16,10 @@ import {
   type ChannelPlugin,
 } from "openclaw/plugin-sdk";
 import { z } from "zod";
+import { resolveSessionAgentId } from "../../../src/agents/agent-scope.js";
 import type { OpenClawConfig } from "../../../src/config/config.js";
+import { loadSessionStore, resolveStorePath } from "../../../src/config/sessions.js";
+import { estimateUsageCost, resolveModelCostConfig } from "../../../src/utils/usage-format.js";
 import { getConsoleRuntime } from "./runtime.js";
 
 const CHANNEL_ID = "console";
@@ -87,6 +91,26 @@ type ConsoleCallbackBody = {
 };
 
 type ConsolePromptStore = Record<string, string>;
+type ConsoleSessionUsageSnapshot = {
+  provider?: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+};
+type ConsoleBillingService = {
+  service_id: string;
+  qty: number;
+};
+type ConsoleBotMarketingContext = {
+  integration: string;
+  botId: string;
+  userId: string;
+};
+
+const BILLING_MAX_RETRIES = 3;
+const BILLING_RETRY_DELAY_MS = 10_000;
 
 const accountHelpers = createAccountListHelpers(CHANNEL_ID);
 const ConsoleConfigSchema = buildChannelConfigSchema(
@@ -217,6 +241,297 @@ function resolveConsoleCallbackRequestUrl(rawHeader: string): string {
     ? trimmedPath || "/request"
     : `${trimmedPath || ""}/request`;
   return parsed.toString();
+}
+
+function resolveConsoleBillingRequestUrl(rawHeader: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawHeader);
+  } catch {
+    throw new Error("invalid X-BILLING-URL header");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("X-BILLING-URL must use http or https");
+  }
+  parsed.pathname = `${parsed.pathname.replace(/\/+$/, "") || ""}/bill`;
+  return parsed.toString();
+}
+
+function resolveConsoleBillingActivityUrl(rawHeader: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawHeader);
+  } catch {
+    throw new Error("invalid X-BILLING-URL header");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("X-BILLING-URL must use http or https");
+  }
+  return parsed.toString();
+}
+
+function parseConsoleBotMarketingContext(
+  rawHeader: string,
+): ConsoleBotMarketingContext | undefined {
+  const parts = rawHeader
+    .split(";")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  const map = new Map<string, string>();
+  for (const part of parts) {
+    const eqIndex = part.indexOf("=");
+    if (eqIndex <= 0) {
+      continue;
+    }
+    const key = part.slice(0, eqIndex).trim().toLowerCase();
+    const value = part.slice(eqIndex + 1).trim();
+    if (!key || !value) {
+      continue;
+    }
+    map.set(key, value);
+  }
+  const app = map.get("app");
+  if (!app) {
+    return undefined;
+  }
+  const appParts = app
+    .split("/")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (appParts.length < 3) {
+    return undefined;
+  }
+  const [integration, botId, userId] = appParts;
+  if (!integration || !botId || !userId) {
+    return undefined;
+  }
+  return { integration, botId, userId };
+}
+
+function normalizeConsoleBillingModel(model: string): string {
+  return model.trim().replaceAll(".", "_");
+}
+
+function toNonNegativeTokenCount(value: number | undefined): number {
+  if (!Number.isFinite(value) || (value ?? 0) <= 0) {
+    return 0;
+  }
+  return Math.floor(value as number);
+}
+
+function buildConsoleBillingServices(
+  snapshot: ConsoleSessionUsageSnapshot,
+): ConsoleBillingService[] {
+  const normalizedModel = normalizeConsoleBillingModel(snapshot.model);
+  if (!normalizedModel) {
+    return [];
+  }
+  const inputTokens = toNonNegativeTokenCount(snapshot.inputTokens);
+  const outputTokens = toNonNegativeTokenCount(snapshot.outputTokens);
+  const cachedTokens =
+    toNonNegativeTokenCount(snapshot.cacheReadTokens) +
+    toNonNegativeTokenCount(snapshot.cacheWriteTokens);
+  const services: ConsoleBillingService[] = [];
+  if (inputTokens > 0) {
+    services.push({ service_id: `${normalizedModel}-input`, qty: inputTokens });
+  }
+  if (outputTokens > 0) {
+    services.push({ service_id: `${normalizedModel}-output`, qty: outputTokens });
+  }
+  if (cachedTokens > 0) {
+    services.push({ service_id: `${normalizedModel}-cached`, qty: cachedTokens });
+  }
+  return services;
+}
+
+async function readConsoleSessionUsageSnapshot(params: {
+  cfg: OpenClawConfig;
+  sessionKey: string;
+}): Promise<ConsoleSessionUsageSnapshot | undefined> {
+  const sessionKey = params.sessionKey.trim();
+  if (!sessionKey) {
+    return undefined;
+  }
+  const agentId = resolveSessionAgentId({ sessionKey, config: params.cfg });
+  const storePath = resolveStorePath(params.cfg.session?.store, { agentId });
+  const store = loadSessionStore(storePath);
+  const entry = store[sessionKey.toLowerCase()] ?? store[sessionKey];
+  const model = typeof entry?.model === "string" ? entry.model.trim() : "";
+  if (!model) {
+    return undefined;
+  }
+  return {
+    provider: typeof entry?.modelProvider === "string" ? entry.modelProvider.trim() : undefined,
+    model,
+    inputTokens: toNonNegativeTokenCount(entry?.inputTokens),
+    outputTokens: toNonNegativeTokenCount(entry?.outputTokens),
+    cacheReadTokens: toNonNegativeTokenCount(entry?.cacheRead),
+    cacheWriteTokens: toNonNegativeTokenCount(entry?.cacheWrite),
+  };
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function postConsoleBillingWithRetry(params: {
+  billingUrl: string;
+  services: ConsoleBillingService[];
+  bearer: string;
+  operationId: string;
+}) {
+  const body = {
+    services: params.services,
+    operationId: params.operationId,
+  };
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= BILLING_MAX_RETRIES; attempt += 1) {
+    try {
+      const response = await fetch(params.billingUrl, {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${params.bearer}`,
+        },
+        body: JSON.stringify(body),
+      });
+      if (response.ok) {
+        return;
+      }
+      lastError = new Error(`billing request failed with status ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < BILLING_MAX_RETRIES) {
+      await sleep(BILLING_RETRY_DELAY_MS);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+async function isConsoleBillingActive(params: {
+  activityUrl: string;
+  bearer: string;
+}): Promise<boolean> {
+  const response = await fetch(params.activityUrl, {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${params.bearer}`,
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`billing activity request failed with status ${response.status}`);
+  }
+  const payload = (await response.json()) as { status?: unknown };
+  return (
+    String(payload.status ?? "")
+      .trim()
+      .toLowerCase() === "active"
+  );
+}
+
+function resolveBotMarketingBaseUrl(integration: string): string | undefined {
+  const normalized = integration.trim();
+  if (!normalized) {
+    return undefined;
+  }
+  if (normalized === "ai_delivery") {
+    return process.env.ai_delivery_base_url?.trim() || process.env.AI_DELIVERY_BASE_URL?.trim();
+  }
+  if (normalized === "ai_delivery_test") {
+    return (
+      process.env.ai_delivery_test_base_url?.trim() || process.env.AI_DELIVERY_TEST_BASE_URL?.trim()
+    );
+  }
+  return undefined;
+}
+
+function resolveBotMarketingPrice(): number | undefined {
+  const raw = process.env.price?.trim() || process.env.PRICE?.trim();
+  if (!raw) {
+    return undefined;
+  }
+  const value = Number.parseInt(raw, 10);
+  return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function calculateBotMarketingAmount(params: {
+  cost: number;
+  exchangeRate: number;
+  price: number;
+}): number {
+  if (!Number.isFinite(params.cost) || params.cost <= 0) {
+    return 0;
+  }
+  const rate =
+    Number.isFinite(params.exchangeRate) && params.exchangeRate > 0 ? params.exchangeRate : 1;
+  if (!Number.isFinite(params.price) || params.price <= 0) {
+    return 0;
+  }
+  const rub = params.cost / rate;
+  return Math.ceil(rub * params.price * 4);
+}
+
+async function fetchExchangeRate(currency: string): Promise<number> {
+  const baseUrl = process.env.exchange_api_url?.trim() || process.env.EXCHANGE_API_URL?.trim();
+  if (!baseUrl) {
+    return 1;
+  }
+  const response = await fetch(baseUrl, {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`exchange request failed with status ${response.status}`);
+  }
+  const payload = (await response.json()) as { rates?: Record<string, unknown> };
+  const rateRaw = payload.rates?.[currency];
+  const rate = typeof rateRaw === "number" ? rateRaw : Number(rateRaw);
+  if (!Number.isFinite(rate) || rate <= 0) {
+    return 1;
+  }
+  return rate;
+}
+
+async function postConsoleBotMarketingBilling(params: {
+  context: ConsoleBotMarketingContext;
+  costUsd: number;
+}) {
+  const baseUrl = resolveBotMarketingBaseUrl(params.context.integration);
+  if (!baseUrl) {
+    throw new Error(
+      `unsupported integration for botmarketing billing: ${params.context.integration}`,
+    );
+  }
+  const price = resolveBotMarketingPrice();
+  if (!price) {
+    throw new Error("botmarketing billing price is not configured");
+  }
+  const rate = await fetchExchangeRate("USD");
+  const amount = calculateBotMarketingAmount({
+    cost: params.costUsd,
+    exchangeRate: rate,
+    price,
+  });
+  if (amount <= 0) {
+    return;
+  }
+  const requestUrl = `${baseUrl.replace(/\/+$/, "")}/api/bot/${encodeURIComponent(params.context.botId)}/user/${encodeURIComponent(params.context.userId)}/billAgent`;
+  const response = await fetch(requestUrl, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ amount }),
+  });
+  if (!response.ok) {
+    throw new Error(`botmarketing billing failed with status ${response.status}`);
+  }
 }
 
 function parseConsoleInboundBody(value: unknown): ConsoleInboundBody {
@@ -456,6 +771,9 @@ async function postConsoleCallback(params: {
 async function processConsoleWebhookRequest(params: {
   account: ResolvedConsoleAccount;
   callbackUrl: string;
+  billingUrl?: string;
+  billingActivityUrl?: string;
+  botMarketingContextHeader?: string;
   body: ConsoleInboundBody;
   channelRuntime: NonNullable<ChannelGatewayContext<ResolvedConsoleAccount>["channelRuntime"]>;
   log?: {
@@ -465,6 +783,7 @@ async function processConsoleWebhookRequest(params: {
   };
 }) {
   const runtime = getConsoleRuntime();
+  const cfg = runtime.config.loadConfig();
   const payloads: ConsoleReplyPayload[] = [];
   const systemPrompt = await getConsoleSessionPrompt(params.body.sessionKey);
 
@@ -474,7 +793,7 @@ async function processConsoleWebhookRequest(params: {
       body: params.body,
       ...(systemPrompt ? { systemPrompt } : {}),
     }),
-    cfg: runtime.config.loadConfig(),
+    cfg,
     dispatcherOptions: {
       deliver: async (payload) => {
         payloads.push(payload as ConsoleReplyPayload);
@@ -493,6 +812,108 @@ async function processConsoleWebhookRequest(params: {
   await postConsoleCallback({
     callbackUrl: params.callbackUrl,
     payloads,
+  });
+
+  if (!params.billingUrl && !params.botMarketingContextHeader) {
+    return;
+  }
+
+  let usageSnapshot: ConsoleSessionUsageSnapshot | undefined;
+  try {
+    usageSnapshot = await readConsoleSessionUsageSnapshot({
+      cfg,
+      sessionKey: params.body.sessionKey,
+    });
+  } catch (error) {
+    params.log?.error?.(`console: failed to read billing usage snapshot: ${String(error)}`);
+    return;
+  }
+  if (!usageSnapshot) {
+    params.log?.warn?.(
+      `console: billing skipped for ${params.body.sessionKey} because model/usage snapshot is missing`,
+    );
+    return;
+  }
+
+  const billingTasks: Promise<void>[] = [];
+
+  if (params.billingUrl) {
+    const bearer = process.env.BILLING_BEARER?.trim();
+    if (!bearer) {
+      params.log?.warn?.("console: X-BILLING-URL was provided but BILLING_BEARER is empty");
+    } else {
+      const services = buildConsoleBillingServices(usageSnapshot);
+      if (services.length > 0) {
+        const activityUrl = params.billingActivityUrl ?? params.billingUrl;
+        billingTasks.push(
+          (async () => {
+            const active = await isConsoleBillingActive({
+              activityUrl,
+              bearer,
+            });
+            if (!active) {
+              params.log?.warn?.("console: billing is not active; skipping /bill request");
+              return;
+            }
+            const operationId = crypto.randomUUID();
+            await postConsoleBillingWithRetry({
+              billingUrl: params.billingUrl!,
+              services,
+              bearer,
+              operationId,
+            });
+          })(),
+        );
+      }
+    }
+  }
+
+  if (params.botMarketingContextHeader) {
+    const parsedContext = parseConsoleBotMarketingContext(params.botMarketingContextHeader);
+    if (!parsedContext) {
+      params.log?.warn?.(
+        "console: invalid x-botmarketing-context header; skipping botmarketing bill",
+      );
+    } else {
+      const costConfig = resolveModelCostConfig({
+        provider: usageSnapshot.provider,
+        model: usageSnapshot.model,
+        config: cfg,
+      });
+      const estimatedCostUsd = estimateUsageCost({
+        usage: {
+          input: usageSnapshot.inputTokens,
+          output: usageSnapshot.outputTokens,
+          cacheRead: usageSnapshot.cacheReadTokens,
+          cacheWrite: usageSnapshot.cacheWriteTokens,
+        },
+        cost: costConfig,
+      });
+      if (!Number.isFinite(estimatedCostUsd) || (estimatedCostUsd ?? 0) <= 0) {
+        params.log?.warn?.(
+          "console: botmarketing billing skipped because estimated cost is unavailable",
+        );
+      } else {
+        billingTasks.push(
+          postConsoleBotMarketingBilling({
+            context: parsedContext,
+            costUsd: estimatedCostUsd,
+          }),
+        );
+      }
+    }
+  }
+
+  if (billingTasks.length === 0) {
+    return;
+  }
+
+  void Promise.allSettled(billingTasks).then((results) => {
+    for (const result of results) {
+      if (result.status === "rejected") {
+        params.log?.error?.(`console: billing request failed: ${String(result.reason)}`);
+      }
+    }
   });
 }
 
@@ -528,12 +949,20 @@ function createConsoleWebhookHandler(params: {
       return true;
     }
 
+    const billingHeader = readHeaderValue(req.headers["x-billing-url"]);
+    const botMarketingContextHeader = readHeaderValue(req.headers["x-botmarketing-context"]);
     let callbackUrl: string;
+    let billingUrl: string | undefined;
+    let billingActivityUrl: string | undefined;
     try {
       callbackUrl = resolveConsoleCallbackRequestUrl(callbackHeader);
+      if (billingHeader) {
+        billingActivityUrl = resolveConsoleBillingActivityUrl(billingHeader);
+        billingUrl = resolveConsoleBillingRequestUrl(billingHeader);
+      }
     } catch (error) {
       res.statusCode = 400;
-      res.end(error instanceof Error ? error.message : "Invalid X-CALLBACK-URL header");
+      res.end(error instanceof Error ? error.message : "Invalid request header");
       return true;
     }
 
@@ -563,6 +992,9 @@ function createConsoleWebhookHandler(params: {
     void processConsoleWebhookRequest({
       account: params.account,
       callbackUrl,
+      ...(billingUrl ? { billingUrl } : {}),
+      ...(billingActivityUrl ? { billingActivityUrl } : {}),
+      ...(botMarketingContextHeader ? { botMarketingContextHeader } : {}),
       body: inboundBody,
       channelRuntime: params.channelRuntime,
       log: params.log,
@@ -881,4 +1313,12 @@ export const consolePlugin: ChannelPlugin<ResolvedConsoleAccount> = {
   },
 };
 
-export { resolveConsoleCallbackRequestUrl, parseConsoleInboundBody };
+export {
+  resolveConsoleBillingRequestUrl,
+  resolveConsoleBillingActivityUrl,
+  resolveConsoleCallbackRequestUrl,
+  parseConsoleInboundBody,
+  buildConsoleBillingServices,
+  parseConsoleBotMarketingContext,
+  calculateBotMarketingAmount,
+};

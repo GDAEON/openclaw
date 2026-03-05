@@ -3,13 +3,18 @@ import os from "node:os";
 import path from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  buildConsoleBillingServices,
   buildConsoleCallbackBody,
+  calculateBotMarketingAmount,
   buildConsoleRoutePath,
   buildConsoleInboundContext,
   clearConsoleSessionPrompt,
   getConsoleSessionPrompt,
   parseConsoleInboundBody,
+  parseConsoleBotMarketingContext,
   setConsoleSessionPrompt,
+  resolveConsoleBillingRequestUrl,
+  resolveConsoleBillingActivityUrl,
   resolveConsoleCallbackRequestUrl,
   type ResolvedConsoleAccount,
 } from "./channel.js";
@@ -50,6 +55,53 @@ describe("console channel helpers", () => {
     expect(resolveConsoleCallbackRequestUrl("https://example.com/callback/request")).toBe(
       "https://example.com/callback/request",
     );
+  });
+
+  it("appends /bill to billing URLs", () => {
+    expect(resolveConsoleBillingRequestUrl("https://billing.example.com/api")).toBe(
+      "https://billing.example.com/api/bill",
+    );
+    expect(resolveConsoleBillingRequestUrl("https://billing.example.com/api/")).toBe(
+      "https://billing.example.com/api/bill",
+    );
+  });
+
+  it("keeps billing activity URL unchanged", () => {
+    expect(resolveConsoleBillingActivityUrl("https://billing.example.com/api")).toBe(
+      "https://billing.example.com/api",
+    );
+  });
+
+  it("builds billing services for input/output/cached token kinds", () => {
+    expect(
+      buildConsoleBillingServices({
+        model: "gpt-5.1-codex",
+        inputTokens: 120,
+        outputTokens: 45,
+        cacheReadTokens: 30,
+        cacheWriteTokens: 10,
+      }),
+    ).toEqual([
+      { service_id: "gpt-5_1-codex-input", qty: 120 },
+      { service_id: "gpt-5_1-codex-output", qty: 45 },
+      { service_id: "gpt-5_1-codex-cached", qty: 40 },
+    ]);
+  });
+
+  it("parses x-botmarketing-context app tuple", () => {
+    expect(
+      parseConsoleBotMarketingContext(
+        "app=ai_delivery_test/my-bot/internal-123; chat=chat_id/chat_id/hash; project=project_id",
+      ),
+    ).toEqual({
+      integration: "ai_delivery_test",
+      botId: "my-bot",
+      userId: "internal-123",
+    });
+  });
+
+  it("calculates botmarketing amount with ceil rounding", () => {
+    expect(calculateBotMarketingAmount({ cost: 1.25, exchangeRate: 0.0125, price: 2 })).toBe(800);
   });
 
   it("builds callback payload with text and media arrays", async () => {
