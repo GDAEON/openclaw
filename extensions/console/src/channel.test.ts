@@ -101,7 +101,7 @@ describe("console channel helpers", () => {
   });
 
   it("calculates botmarketing amount with ceil rounding", () => {
-    expect(calculateBotMarketingAmount({ cost: 1.25, exchangeRate: 0.0125, price: 2 })).toBe(800);
+    expect(calculateBotMarketingAmount({ cost: 1.25, exchangeRate: 0.0125, price: 2 })).toBe(200);
   });
 
   it("builds callback payload with text and media arrays", async () => {

@@ -108,6 +108,11 @@ type ConsoleBotMarketingContext = {
   botId: string;
   userId: string;
 };
+type ConsoleLogSink = {
+  info?: (message: string) => void;
+  warn?: (message: string) => void;
+  error?: (message: string) => void;
+};
 
 const BILLING_MAX_RETRIES = 3;
 const BILLING_RETRY_DELAY_MS = 10_000;
@@ -374,11 +379,24 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function readResponsePreview(response: Response): Promise<string> {
+  try {
+    const body = (await response.text()).trim();
+    if (!body) {
+      return "<empty>";
+    }
+    return body.length > 500 ? `${body.slice(0, 500)}...` : body;
+  } catch {
+    return "<unreadable>";
+  }
+}
+
 async function postConsoleBillingWithRetry(params: {
   billingUrl: string;
   services: ConsoleBillingService[];
   bearer: string;
   operationId: string;
+  log?: ConsoleLogSink;
 }) {
   const body = {
     services: params.services,
@@ -387,6 +405,9 @@ async function postConsoleBillingWithRetry(params: {
   let lastError: unknown;
   for (let attempt = 0; attempt <= BILLING_MAX_RETRIES; attempt += 1) {
     try {
+      params.log?.info?.(
+        `console: billing /bill request attempt=${attempt + 1} operationId=${params.operationId} url=${params.billingUrl}`,
+      );
       const response = await fetch(params.billingUrl, {
         method: "POST",
         headers: {
@@ -396,6 +417,10 @@ async function postConsoleBillingWithRetry(params: {
         },
         body: JSON.stringify(body),
       });
+      const preview = await readResponsePreview(response.clone());
+      params.log?.info?.(
+        `console: billing /bill response operationId=${params.operationId} status=${response.status} body=${preview}`,
+      );
       if (response.ok) {
         return;
       }
@@ -413,7 +438,9 @@ async function postConsoleBillingWithRetry(params: {
 async function isConsoleBillingActive(params: {
   activityUrl: string;
   bearer: string;
+  log?: ConsoleLogSink;
 }): Promise<boolean> {
+  params.log?.info?.(`console: billing activity request url=${params.activityUrl}`);
   const response = await fetch(params.activityUrl, {
     method: "GET",
     headers: {
@@ -421,6 +448,10 @@ async function isConsoleBillingActive(params: {
       Authorization: `Bearer ${params.bearer}`,
     },
   });
+  const preview = await readResponsePreview(response.clone());
+  params.log?.info?.(
+    `console: billing activity response status=${response.status} body=${preview}`,
+  );
   if (!response.ok) {
     throw new Error(`billing activity request failed with status ${response.status}`);
   }
@@ -471,7 +502,7 @@ function calculateBotMarketingAmount(params: {
     return 0;
   }
   const rub = params.cost / rate;
-  return Math.ceil(rub * params.price * 4);
+  return Math.ceil(rub * params.price);
 }
 
 async function fetchExchangeRate(currency: string): Promise<number> {
@@ -500,6 +531,7 @@ async function fetchExchangeRate(currency: string): Promise<number> {
 async function postConsoleBotMarketingBilling(params: {
   context: ConsoleBotMarketingContext;
   costUsd: number;
+  log?: ConsoleLogSink;
 }) {
   const baseUrl = resolveBotMarketingBaseUrl(params.context.integration);
   if (!baseUrl) {
@@ -511,6 +543,9 @@ async function postConsoleBotMarketingBilling(params: {
   if (!price) {
     throw new Error("botmarketing billing price is not configured");
   }
+  params.log?.info?.(
+    `console: botmarketing billing start integration=${params.context.integration} botId=${params.context.botId} userId=${params.context.userId} costUsd=${params.costUsd}`,
+  );
   const rate = await fetchExchangeRate("USD");
   const amount = calculateBotMarketingAmount({
     cost: params.costUsd,
@@ -518,9 +553,11 @@ async function postConsoleBotMarketingBilling(params: {
     price,
   });
   if (amount <= 0) {
+    params.log?.info?.("console: botmarketing billing skipped because computed amount <= 0");
     return;
   }
   const requestUrl = `${baseUrl.replace(/\/+$/, "")}/api/bot/${encodeURIComponent(params.context.botId)}/user/${encodeURIComponent(params.context.userId)}/billAgent`;
+  params.log?.info?.(`console: botmarketing billing request url=${requestUrl} amount=${amount}`);
   const response = await fetch(requestUrl, {
     method: "POST",
     headers: {
@@ -529,6 +566,10 @@ async function postConsoleBotMarketingBilling(params: {
     },
     body: JSON.stringify({ amount }),
   });
+  const preview = await readResponsePreview(response.clone());
+  params.log?.info?.(
+    `console: botmarketing billing response status=${response.status} body=${preview}`,
+  );
   if (!response.ok) {
     throw new Error(`botmarketing billing failed with status ${response.status}`);
   }
@@ -850,6 +891,7 @@ async function processConsoleWebhookRequest(params: {
             const active = await isConsoleBillingActive({
               activityUrl,
               bearer,
+              log: params.log,
             });
             if (!active) {
               params.log?.warn?.("console: billing is not active; skipping /bill request");
@@ -861,6 +903,7 @@ async function processConsoleWebhookRequest(params: {
               services,
               bearer,
               operationId,
+              log: params.log,
             });
           })(),
         );
@@ -898,6 +941,7 @@ async function processConsoleWebhookRequest(params: {
           postConsoleBotMarketingBilling({
             context: parsedContext,
             costUsd: estimatedCostUsd,
+            log: params.log,
           }),
         );
       }
