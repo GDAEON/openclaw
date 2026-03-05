@@ -19,7 +19,11 @@ import { z } from "zod";
 import { resolveSessionAgentId } from "../../../src/agents/agent-scope.js";
 import type { OpenClawConfig } from "../../../src/config/config.js";
 import { loadSessionStore, resolveStorePath } from "../../../src/config/sessions.js";
-import { estimateUsageCost, resolveModelCostConfig } from "../../../src/utils/usage-format.js";
+import {
+  estimateUsageCost,
+  resolveModelCostConfig,
+  type ModelCostConfig,
+} from "../../../src/utils/usage-format.js";
 import { getConsoleRuntime } from "./runtime.js";
 
 const CHANNEL_ID = "console";
@@ -505,6 +509,38 @@ function calculateBotMarketingAmount(params: {
   return Math.ceil(rub * params.price);
 }
 
+function resolveConsoleModelCostConfig(params: {
+  cfg: OpenClawConfig;
+  provider?: string;
+  model: string;
+}): ModelCostConfig | undefined {
+  const direct = resolveModelCostConfig({
+    provider: params.provider,
+    model: params.model,
+    config: params.cfg,
+  });
+  if (direct) {
+    return direct;
+  }
+
+  const providers = params.cfg.models?.providers ?? {};
+  let matched: ModelCostConfig | undefined;
+  let matchCount = 0;
+  for (const provider of Object.values(providers)) {
+    for (const modelEntry of provider.models ?? []) {
+      if (modelEntry.id !== params.model || !modelEntry.cost) {
+        continue;
+      }
+      matched = modelEntry.cost;
+      matchCount += 1;
+      if (matchCount > 1) {
+        return undefined;
+      }
+    }
+  }
+  return matched;
+}
+
 async function fetchExchangeRate(currency: string): Promise<number> {
   const baseUrl = process.env.exchange_api_url?.trim() || process.env.EXCHANGE_API_URL?.trim();
   if (!baseUrl) {
@@ -918,10 +954,10 @@ async function processConsoleWebhookRequest(params: {
         "console: invalid x-botmarketing-context header; skipping botmarketing bill",
       );
     } else {
-      const costConfig = resolveModelCostConfig({
+      const costConfig = resolveConsoleModelCostConfig({
+        cfg,
         provider: usageSnapshot.provider,
         model: usageSnapshot.model,
-        config: cfg,
       });
       const estimatedCostUsd = estimateUsageCost({
         usage: {
@@ -934,7 +970,7 @@ async function processConsoleWebhookRequest(params: {
       });
       if (!Number.isFinite(estimatedCostUsd) || (estimatedCostUsd ?? 0) <= 0) {
         params.log?.warn?.(
-          "console: botmarketing billing skipped because estimated cost is unavailable",
+          `console: botmarketing billing skipped because estimated cost is unavailable (provider=${usageSnapshot.provider ?? "unknown"}, model=${usageSnapshot.model})`,
         );
       } else {
         billingTasks.push(
